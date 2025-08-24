@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crime Detection System</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        select, button {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+        button {
+            background-color: #dc3545;
+            color: white;
+            border: none;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        button:hover {
+            background-color: #c82333;
+        }
+        .note {
+            background-color: #fff3cd;
+            border: 1px solid #ffeaa7;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚨 AI Crime Detection System</h1>
+        
+        <form action="/detect_crime" method="post">
+            <div class="form-group">
+                <label for="source">Select Detection Source:</label>
+                <select name="source" id="source" required>
+                    <option value="">Choose source...</option>
+                    <option value="webcam">Live Webcam</option>
+                    <option value="video">Upload Video File</option>
+                </select>
+            </div>
+            
+            <button type="submit">Start Crime Detection</button>
+        </form>
+        
+        <div class="note">
+            <h3>⚠️ Important Notes:</h3>
+            <ul>
+                <li>Violence is only detected after 3-5 seconds of consistent activity for improved accuracy</li>
+                <li>Only 2-4 key frames are saved per incident to optimize storage</li>
+                <li>Telegram alerts are sent automatically when violence is detected</li>
+                <li>Make sure your webcam is connected and permissions are granted</li>
+                <li>Press 'q' to quit the detection window</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
