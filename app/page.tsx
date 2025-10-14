@@ -1,7 +1,7 @@
 "use client"
 
 import type React from "react"
-
+import useSWR from "swr"
 import { useState, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -34,6 +34,8 @@ interface DetectionLog {
   type: string
 }
 
+const fetcher = (url: string) => fetch(url).then((r) => r.json())
+
 export default function CrimeDetectionSystem() {
   const [isDetecting, setIsDetecting] = useState(false)
   const [detectionLogs, setDetectionLogs] = useState<DetectionLog[]>([])
@@ -42,36 +44,51 @@ export default function CrimeDetectionSystem() {
   const [activeTab, setActiveTab] = useState("webcam")
   const [backendConnected, setBackendConnected] = useState(false)
   const [isProcessing, setIsProcessing] = useState(false)
+  const [liveStatus, setLiveStatus] = useState<{
+    violence: boolean
+    confidence: number
+    frame?: string
+    active?: boolean
+  } | null>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const checkBackendConnection = async () => {
-    try {
-      const response = await fetch("http://localhost:5000/api/health", {
-        method: "GET",
-        headers: {
-          "Content-Type": "application/json",
-        },
-      })
-      if (response.ok) {
-        setBackendConnected(true)
-        console.log("[v0] Backend connected successfully")
-        return true
-      } else {
-        throw new Error("Backend not responding")
-      }
-    } catch (error) {
-      console.log("[v0] Backend not available")
+  const { data: healthData } = useSWR("http://localhost:5000/api/health", fetcher)
+  const { data: swrLiveStatus } = useSWR(
+    backendConnected && isDetecting ? "http://localhost:5000/api/live_status" : null,
+    fetcher,
+    { refreshInterval: 500 }, // ~2 FPS UI update; backend runs much faster
+  )
+
+  useEffect(() => {
+    if (healthData) {
+      setBackendConnected(true)
+      console.log("[v0] Backend connected successfully")
+    } else {
       setBackendConnected(false)
-      return false
+      console.log("[v0] Backend not available")
     }
-  }
+  }, [healthData])
+
+  useEffect(() => {
+    if (swrLiveStatus) {
+      setLiveStatus({
+        violence: !!swrLiveStatus.violence,
+        confidence: Number(swrLiveStatus.confidence) || 0,
+        frame: swrLiveStatus.frame,
+        active: !!swrLiveStatus.active,
+      })
+      if (swrLiveStatus.violence) {
+        setCurrentAlert(`Violence detected! Confidence ${(Number(swrLiveStatus.confidence) * 100).toFixed(1)}%`)
+        const t = setTimeout(() => setCurrentAlert(null), 2000)
+        return () => clearTimeout(t)
+      }
+    }
+  }, [swrLiveStatus])
 
   const fetchDetectionLogs = async () => {
-    const isConnected = await checkBackendConnection()
-
-    if (isConnected) {
+    if (backendConnected) {
       try {
         const response = await fetch("http://localhost:5000/api/detections")
         if (response.ok) {
@@ -119,7 +136,7 @@ export default function CrimeDetectionSystem() {
     fetchDetectionLogs()
     const interval = setInterval(fetchDetectionLogs, 5000)
     return () => clearInterval(interval)
-  }, [])
+  }, [backendConnected])
 
   const startWebcamDetection = async () => {
     try {
@@ -259,6 +276,69 @@ export default function CrimeDetectionSystem() {
     setTimeout(() => setCurrentAlert(null), 5000)
   }
 
+  useEffect(() => {
+    let rafId: number | null = null
+    const drawOverlay = () => {
+      const video = videoRef.current
+      const canvas = canvasRef.current
+      if (!video || !canvas) return
+      const w = video.videoWidth || video.clientWidth
+      const h = video.videoHeight || video.clientHeight
+      if (w === 0 || h === 0) {
+        rafId = requestAnimationFrame(drawOverlay)
+        return
+      }
+      if (canvas.width !== w) canvas.width = w
+      if (canvas.height !== h) canvas.height = h
+      const ctx = canvas.getContext("2d")
+      if (!ctx) return
+      ctx.clearRect(0, 0, w, h)
+
+      if (liveStatus) {
+        // Banner background
+        ctx.globalAlpha = 0.25
+        ctx.fillStyle = liveStatus.violence ? "#ef4444" : "#22c55e"
+        ctx.fillRect(0, 0, w, 48)
+        ctx.globalAlpha = 1
+
+        // Text
+        ctx.font = "600 16px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial"
+        ctx.fillStyle = "#111827"
+        const statusText = liveStatus.violence ? "VIOLENCE DETECTED" : "Monitoring..."
+        const conf = Number.isFinite(liveStatus.confidence) ? liveStatus.confidence : 0
+        const confText = `Confidence: ${(conf * 100).toFixed(1)}%`
+        ctx.fillText(`SecureWatch • ${statusText}`, 12, 20)
+        ctx.fillText(confText, 12, 40)
+
+        // Flashing dot when active
+        if (liveStatus.active) {
+          ctx.beginPath()
+          ctx.arc(w - 24, 24, 8, 0, Math.PI * 2)
+          ctx.fillStyle = liveStatus.violence ? "#dc2626" : "#16a34a"
+          ctx.fill()
+        }
+      }
+      rafId = requestAnimationFrame(drawOverlay)
+    }
+
+    if (isDetecting) {
+      if (canvasRef.current) {
+        canvasRef.current.style.display = "block"
+      }
+      rafId = requestAnimationFrame(drawOverlay)
+    } else {
+      if (canvasRef.current) {
+        canvasRef.current.style.display = "none"
+        const ctx = canvasRef.current.getContext("2d")
+        if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height)
+      }
+    }
+
+    return () => {
+      if (rafId) cancelAnimationFrame(rafId)
+    }
+  }, [isDetecting, liveStatus])
+
   return (
     <div className="min-h-screen bg-white">
       <div className="container mx-auto px-4 py-8">
@@ -316,8 +396,8 @@ export default function CrimeDetectionSystem() {
                     <CardTitle className="text-black flex items-center gap-2">
                       <Camera className="h-5 w-5" />
                       Live Webcam Detection
-                      <Badge variant="outline" className="ml-2 text-orange-600 border-orange-600">
-                        Under Work
+                      <Badge variant="outline" className="ml-2 text-green-700 border-green-700">
+                        Live
                       </Badge>
                     </CardTitle>
                     <CardDescription className="text-gray-600">
@@ -327,7 +407,7 @@ export default function CrimeDetectionSystem() {
                   <CardContent>
                     <div className="relative bg-black rounded-lg overflow-hidden aspect-video">
                       <video ref={videoRef} className="w-full h-full object-cover" muted />
-                      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ display: "none" }} />
+                      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
                       {!isDetecting && (
                         <div className="absolute inset-0 flex items-center justify-center">
                           <div className="text-center text-gray-400">

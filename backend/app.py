@@ -21,8 +21,10 @@ bot = telepot.Bot('6679358098:AAFmpDc7o4MwqDywDahyAK0Qq89IVZqNr04')  # Replace w
 # Global variables for detection state
 detection_active = False
 detection_thread = None
+last_status = {"violence": False, "confidence": 0.0, "timestamp": None}
+latest_frame_filename = None
 
-def init_database():
+def init_database(): 
     conn = sqlite3.connect('crime_detections.db')
     cursor = conn.cursor()
     cursor.execute('''
@@ -189,6 +191,8 @@ SecureWatch AI has detected potential violence. Please review immediately."""
                             self.current_incident_frames.append(frame_filename)
                             print(f"[INFO] VIOLENCE FRAME SAVED - Confidence: {confidence:.3f}, File: {frame_filename} ({file_size} bytes)")
                             print(f"[DEBUG] Violence frames in current incident: {len(self.current_incident_frames)}")
+                            global latest_frame_filename
+                            latest_frame_filename = frame_filename
                         else:
                             print(f"[ERROR] Frame file created but empty: {frame_filename}")
                             os.remove(frame_filename)  # Remove empty file
@@ -277,14 +281,29 @@ def process_video_with_detection(input_video, output_video_path):
     print(f"[INFO] VIOLENCE-ONLY MODE: Only frames with violence=True will be saved and logged")
     
     while True:
+        # Respect stop for webcam
+        if isinstance(input_video, int) and not detection_active:
+            print("[INFO] Stop requested - ending live detection loop")
+            break
+
         ret, frame = cap.read()
         if not ret:
             print("[DEBUG] End of video reached")
             break
-            
-        # Process frame for violence detection
+
         violence_detected, confidence = detector.detect_violence_in_frame(frame)
-        
+
+        # Update live status globals (no locking needed for simple reads)
+        try:
+            last_status = {
+                "violence": bool(violence_detected),
+                "confidence": float(confidence),
+                "timestamp": datetime.now().isoformat(),
+                "active": True
+            }
+        except Exception as _:
+            pass
+
         if violence_detected and confidence > detector.violence_threshold:
             print(f"[DEBUG] VIOLENCE CONFIRMED at frame {frame_number} with confidence {confidence:.3f}")
             detector.log_violence_incident(frame, confidence, frame_number, output_video_path)
@@ -308,6 +327,12 @@ def process_video_with_detection(input_video, output_video_path):
     # Cleanup
     cap.release()
     out.release()
+    
+    # Mark inactive after finishing
+    try:
+        last_status["active"] = False
+    except Exception:
+        pass
     
     print(f"[INFO] Video processing complete - Violence incidents detected and logged: {detector.total_incidents}")
     return detector.total_incidents
@@ -408,27 +433,52 @@ def health_check():
         'timestamp': datetime.now().isoformat()
     })
 
+@app.route('/api/live_status', methods=['GET'])
+def live_status():
+    """Endpoint to get the latest status of live detection"""
+    global last_status
+    try:
+        frame_url = None
+        if latest_frame_filename and os.path.exists(latest_frame_filename):
+            frame_url = f"http://localhost:5000/api/frame/{os.path.basename(latest_frame_filename)}"
+        return jsonify({
+            "active": bool(last_status.get("active", False)),
+            "violence": bool(last_status.get("violence", False)),
+            "confidence": float(last_status.get("confidence", 0.0)),
+            "timestamp": last_status.get("timestamp"),
+            "frame": frame_url
+        })
+    except Exception as e:
+        print(f"[ERROR] live_status failed: {e}")
+        return jsonify({"active": False, "violence": False, "confidence": 0.0}), 200
+
+@app.route('/api/latest_frame', methods=['GET'])
+def latest_frame():
+    """Endpoint to get the latest frame with detected violence"""
+    global latest_frame_filename
+    if latest_frame_filename and os.path.exists(latest_frame_filename):
+        return send_file(latest_frame_filename)
+    else:
+        return jsonify({'error': 'No latest frame available'}), 404
+
 # API Routes for React frontend
 @app.route('/api/start_detection', methods=['POST'])
 def start_detection():
-    global detection_active, detection_thread
-    
+    global detection_active, detection_thread, last_status
     data = request.json or {}
     source = data.get('source', 'webcam')
-    
+
     if detection_active:
         return jsonify({'error': 'Detection already active'}), 400
-    
+
     detection_active = True
+    last_status = {"violence": False, "confidence": 0.0, "timestamp": datetime.now().isoformat(), "active": True}
     input_video = 0 if source == 'webcam' else data.get('video_path', 'your_video.mp4')
     output_video_file = f'processed_videos/live_detection_{int(time.time())}.mp4'
-    
-    detection_thread = threading.Thread(
-        target=process_video_with_detection,
-        args=(input_video, output_video_file)
-    )
+
+    detection_thread = threading.Thread(target=process_video_with_detection, args=(input_video, output_video_file), daemon=True)
     detection_thread.start()
-    
+
     return jsonify({'message': 'Detection started', 'status': 'active'})
 
 @app.route('/api/stop_detection', methods=['POST'])
