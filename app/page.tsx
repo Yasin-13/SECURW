@@ -1,37 +1,23 @@
 "use client"
 
 import type React from "react"
-
 import { useState, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import {
-  Play,
-  Square,
-  Upload,
-  Camera,
-  AlertTriangle,
-  Clock,
-  Download,
-  Eye,
-  FileVideo,
-  Info,
-  CheckCircle,
-} from "lucide-react"
+import { Play, Square, Upload, Camera, AlertTriangle, Clock, CheckCircle, Info, RefreshCw } from "lucide-react"
 
 interface DetectionLog {
   id: string
   timestamp: string
-  duration: number
-  frames: string[]
   confidence: number
-  videoPath?: string
+  frames: string[]
   source: string
-  status: string
   type: string
+  severity: string
+  status: string
 }
 
 export default function CrimeDetectionSystem() {
@@ -42,27 +28,20 @@ export default function CrimeDetectionSystem() {
   const [activeTab, setActiveTab] = useState("webcam")
   const [backendConnected, setBackendConnected] = useState(false)
   const [isProcessing, setIsProcessing] = useState(false)
+  const [isRefreshing, setIsRefreshing] = useState(false)
   const videoRef = useRef<HTMLVideoElement>(null)
-  const canvasRef = useRef<HTMLCanvasElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const checkBackendConnection = async () => {
     try {
       const response = await fetch("http://localhost:5000/api/health", {
         method: "GET",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
       })
-      if (response.ok) {
-        setBackendConnected(true)
-        console.log("[v0] Backend connected successfully")
-        return true
-      } else {
-        throw new Error("Backend not responding")
-      }
+      setBackendConnected(response.ok)
+      return response.ok
     } catch (error) {
-      console.log("[v0] Backend not available")
+      console.log("[v0] Backend connection failed")
       setBackendConnected(false)
       return false
     }
@@ -73,51 +52,24 @@ export default function CrimeDetectionSystem() {
 
     if (isConnected) {
       try {
+        setIsRefreshing(true)
         const response = await fetch("http://localhost:5000/api/detections")
         if (response.ok) {
           const logs = await response.json()
           console.log("[v0] Fetched detection logs:", logs.length, "incidents")
           setDetectionLogs(logs)
-        } else {
-          throw new Error("Failed to fetch logs")
         }
       } catch (error) {
-        console.log("[v0] Failed to fetch logs, using empty array")
-        setDetectionLogs([])
+        console.log("[v0] Failed to fetch logs")
+      } finally {
+        setIsRefreshing(false)
       }
-    } else {
-      // Use mock data when backend is not available
-      const mockDetectionLogs: DetectionLog[] = [
-        {
-          id: "demo-1",
-          timestamp: "2024-01-15 14:30:25",
-          duration: 4.2,
-          frames: ["/security-camera-frame-1.png", "/security-camera-frame-2.png"],
-          confidence: 0.87,
-          videoPath: "/processed_video_1.mp4",
-          source: "Upload",
-          status: "active",
-          type: "Violence",
-        },
-        {
-          id: "demo-2",
-          timestamp: "2024-01-15 12:15:10",
-          duration: 3.8,
-          frames: ["/security-camera-frame-3.png", "/security-camera-frame-4.png"],
-          confidence: 0.92,
-          videoPath: "/processed_video_2.mp4",
-          source: "Upload",
-          status: "active",
-          type: "Violence",
-        },
-      ]
-      setDetectionLogs(mockDetectionLogs)
     }
   }
 
   useEffect(() => {
     fetchDetectionLogs()
-    const interval = setInterval(fetchDetectionLogs, 5000)
+    const interval = setInterval(fetchDetectionLogs, 2000)
     return () => clearInterval(interval)
   }, [])
 
@@ -131,36 +83,17 @@ export default function CrimeDetectionSystem() {
       setIsDetecting(true)
 
       if (backendConnected) {
-        try {
-          const response = await fetch("http://localhost:5000/api/start_detection", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ source: "webcam" }),
-          })
-
-          if (response.ok) {
-            setCurrentAlert("Live detection started - Monitoring for violence...")
-          } else {
-            setCurrentAlert("Failed to start backend detection - Running in demo mode")
-          }
-        } catch (error) {
-          setCurrentAlert("Backend not available - Running in demo mode")
+        const response = await fetch("http://localhost:5000/api/start_detection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ source: "webcam" }),
+        })
+        if (response.ok) {
+          setCurrentAlert("Live detection started - Monitoring for crime...")
         }
-      } else {
-        // Demo mode simulation
-        setTimeout(() => {
-          setCurrentAlert("Violence detected! Duration: 4.2s - Alerting authorities... (Demo Mode)")
-          setTimeout(() => setCurrentAlert(null), 5000)
-        }, 10000)
       }
-
-      setTimeout(() => setCurrentAlert(null), 3000)
     } catch (error) {
-      console.error("Error accessing webcam:", error)
-      setCurrentAlert("Camera access denied. Please allow camera permissions.")
-      setTimeout(() => setCurrentAlert(null), 5000)
+      setCurrentAlert("Camera access denied.")
     }
   }
 
@@ -176,14 +109,12 @@ export default function CrimeDetectionSystem() {
       try {
         await fetch("http://localhost:5000/api/stop_detection", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
+          headers: { "Content-Type": "application/json" },
         })
         setCurrentAlert("Detection stopped")
         setTimeout(() => setCurrentAlert(null), 2000)
       } catch (error) {
-        console.log("[v0] Failed to stop backend detection")
+        console.log("[v0] Failed to stop detection")
       }
     }
   }
@@ -195,7 +126,6 @@ export default function CrimeDetectionSystem() {
       if (videoRef.current) {
         videoRef.current.src = URL.createObjectURL(file)
       }
-      console.log("[v0] File selected:", file.name)
     }
   }
 
@@ -203,14 +133,13 @@ export default function CrimeDetectionSystem() {
     if (!selectedFile) return
 
     setIsProcessing(true)
-    setCurrentAlert("Processing video... Please wait")
+    setCurrentAlert("Processing video... Detecting crimes frame by frame")
 
     if (backendConnected) {
       const formData = new FormData()
       formData.append("video", selectedFile)
 
       try {
-        console.log("[v0] Uploading video to backend for processing")
         const response = await fetch("http://localhost:5000/api/process_video", {
           method: "POST",
           body: formData,
@@ -218,10 +147,10 @@ export default function CrimeDetectionSystem() {
 
         if (response.ok) {
           const result = await response.json()
-          console.log("[v0] Processing result:", result)
-
           const incidentCount = result.incidents_detected || 0
-          setCurrentAlert(`Processing complete! ${incidentCount} incidents detected.`)
+          setCurrentAlert(
+            `Processing complete! ${incidentCount} crime incidents detected with alerts sent to Telegram.`,
+          )
 
           // Refresh logs after processing
           setTimeout(() => {
@@ -233,26 +162,8 @@ export default function CrimeDetectionSystem() {
         }
       } catch (error) {
         console.error("[v0] Error processing video:", error)
-        setCurrentAlert("Backend connection failed. Please check if the backend is running.")
+        setCurrentAlert("Backend connection failed.")
       }
-    } else {
-      // Demo mode simulation
-      setTimeout(() => {
-        setCurrentAlert("Processing complete! 2 incidents detected. (Demo Mode)")
-        // Add a new mock detection
-        const newDetection: DetectionLog = {
-          id: `demo-${Date.now()}`,
-          timestamp: new Date().toLocaleString(),
-          duration: 4.5,
-          frames: ["/security-camera-frame-1.png", "/security-camera-frame-2.png"],
-          confidence: 0.89,
-          videoPath: "/demo_processed_video.mp4",
-          source: "Upload",
-          status: "active",
-          type: "Violence",
-        }
-        setDetectionLogs((prev) => [newDetection, ...prev])
-      }, 3000)
     }
 
     setIsProcessing(false)
@@ -264,29 +175,31 @@ export default function CrimeDetectionSystem() {
       <div className="container mx-auto px-4 py-8">
         <div className="text-center mb-8">
           <h1 className="text-4xl font-bold text-black mb-2">SecureWatch</h1>
-          <p className="text-gray-600 text-lg">Advanced Violence Detection & Monitoring System</p>
+          <p className="text-gray-600 text-lg">Real-Time Violence Detection & Alert System</p>
         </div>
 
         <Alert
-          className={`mb-6 ${backendConnected ? "border-green-500 bg-green-50 text-green-800" : "border-blue-500 bg-blue-50 text-blue-800"}`}
+          className={`mb-6 ${
+            backendConnected
+              ? "border-green-500 bg-green-50 text-green-800"
+              : "border-blue-500 bg-blue-50 text-blue-800"
+          }`}
         >
           {backendConnected ? <CheckCircle className="h-4 w-4" /> : <Info className="h-4 w-4" />}
           <AlertDescription>
             {backendConnected ? (
               <>
-                <strong>Backend Connected:</strong> Full system operational with real-time violence detection and
-                logging.
+                <strong>Backend Connected:</strong> Real-time detection active. All crimes detected will be sent to
+                Telegram with 3-frame evidence.
               </>
             ) : (
               <>
-                <strong>Demo Mode:</strong> Backend not connected. To run the full system, start the Python Flask
-                backend on localhost:5000. Currently showing mock data for demonstration.
+                <strong>Demo Mode:</strong> Backend not connected. Start the Python Flask backend on localhost:5000.
               </>
             )}
           </AlertDescription>
         </Alert>
 
-        {/* Alert Banner */}
         {currentAlert && (
           <Alert className="mb-6 border-red-500 bg-red-50 text-red-800">
             <AlertTriangle className="h-4 w-4" />
@@ -309,25 +222,23 @@ export default function CrimeDetectionSystem() {
 
           <TabsContent value="webcam">
             <div className="grid lg:grid-cols-3 gap-6">
-              {/* Main Detection Panel */}
               <div className="lg:col-span-2">
                 <Card className="bg-white border-gray-200 shadow-lg">
                   <CardHeader>
                     <CardTitle className="text-black flex items-center gap-2">
                       <Camera className="h-5 w-5" />
                       Live Webcam Detection
-                      <Badge variant="outline" className="ml-2 text-orange-600 border-orange-600">
-                        Under Work
+                      <Badge variant="outline" className="ml-2 text-green-600 border-green-600">
+                        Real-Time
                       </Badge>
                     </CardTitle>
                     <CardDescription className="text-gray-600">
-                      Real-time violence detection with AI monitoring
+                      Real-time violence detection with instant Telegram alerts
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
                     <div className="relative bg-black rounded-lg overflow-hidden aspect-video">
                       <video ref={videoRef} className="w-full h-full object-cover" muted />
-                      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ display: "none" }} />
                       {!isDetecting && (
                         <div className="absolute inset-0 flex items-center justify-center">
                           <div className="text-center text-gray-400">
@@ -340,7 +251,7 @@ export default function CrimeDetectionSystem() {
                         <div className="absolute top-4 left-4">
                           <Badge variant="destructive" className="animate-pulse">
                             <div className="w-2 h-2 bg-red-500 rounded-full mr-2 animate-ping" />
-                            MONITORING
+                            LIVE MONITORING
                           </Badge>
                         </div>
                       )}
@@ -367,36 +278,32 @@ export default function CrimeDetectionSystem() {
                 </Card>
               </div>
 
-              {/* System Status Sidebar */}
               <div className="space-y-6">
                 <Card className="bg-white border-gray-200 shadow-lg">
                   <CardHeader>
-                    <CardTitle className="text-black text-lg">System Status</CardTitle>
+                    <CardTitle className="text-black text-lg flex items-center justify-between">
+                      System Status
+                      {isRefreshing && <RefreshCw className="h-4 w-4 animate-spin" />}
+                    </CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-3">
                     <div className="flex justify-between items-center">
                       <span className="text-gray-600">Detection Engine</span>
-                      <Badge className="bg-green-100 text-green-800 hover:bg-green-100">Active</Badge>
+                      <Badge className="bg-green-100 text-green-800">Active</Badge>
                     </div>
                     <div className="flex justify-between items-center">
-                      <span className="text-gray-600">Backend Connection</span>
-                      <Badge
-                        className={
-                          backendConnected
-                            ? "bg-green-100 text-green-800 hover:bg-green-100"
-                            : "bg-red-100 text-red-800 hover:bg-red-100"
-                        }
-                      >
-                        {backendConnected ? "Connected" : "Demo Mode"}
+                      <span className="text-gray-600">Backend Status</span>
+                      <Badge className={backendConnected ? "bg-green-100 text-green-800" : "bg-red-100 text-red-800"}>
+                        {backendConnected ? "Connected" : "Offline"}
                       </Badge>
-                    </div>
-                    <div className="flex justify-between items-center">
-                      <span className="text-gray-600">Model Accuracy</span>
-                      <span className="text-black font-medium">94.2%</span>
                     </div>
                     <div className="flex justify-between items-center">
                       <span className="text-gray-600">Total Incidents</span>
                       <span className="text-black font-medium">{detectionLogs.length}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-gray-600">Frames per Incident</span>
+                      <span className="text-black font-medium">Max 3</span>
                     </div>
                   </CardContent>
                 </Card>
@@ -412,7 +319,7 @@ export default function CrimeDetectionSystem() {
                   Video Analysis
                 </CardTitle>
                 <CardDescription className="text-gray-600">
-                  Upload video files for violence detection analysis
+                  Upload video files for violence detection and instant Telegram alerts
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -465,15 +372,14 @@ export default function CrimeDetectionSystem() {
               <CardHeader>
                 <CardTitle className="text-black text-lg">Detection Logs & Evidence</CardTitle>
                 <CardDescription className="text-gray-600">
-                  Complete history of detected incidents with frames and processed videos
+                  Complete history of detected incidents with evidence frames sent to Telegram
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
                 {detectionLogs.length === 0 ? (
                   <div className="text-center py-8 text-gray-500">
                     <AlertTriangle className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                    <p>No incidents detected yet</p>
-                    <p className="text-sm mt-2">Upload a video or start live detection to see results here</p>
+                    <p>No crimes detected yet</p>
                   </div>
                 ) : (
                   detectionLogs.map((log) => (
@@ -484,110 +390,44 @@ export default function CrimeDetectionSystem() {
                           {log.timestamp}
                         </div>
                         <Badge variant="destructive" className="text-xs">
-                          {log.type || "Violence"} Detected
+                          {log.type} - {log.severity}
                         </Badge>
                       </div>
 
                       <div className="grid grid-cols-2 gap-4 text-sm">
                         <div>
-                          <span className="text-gray-600">Duration:</span>
-                          <span className="ml-2 font-medium text-black">{log.duration}s</span>
-                        </div>
-                        <div>
                           <span className="text-gray-600">Confidence:</span>
                           <span className="ml-2 font-medium text-black">{(log.confidence * 100).toFixed(1)}%</span>
+                        </div>
+                        <div>
+                          <span className="text-gray-600">Frames:</span>
+                          <span className="ml-2 font-medium text-black">{log.frames.length}/3</span>
                         </div>
                       </div>
 
                       <div>
-                        <h4 className="text-sm font-medium text-black mb-2">Key Frames Captured:</h4>
+                        <h4 className="text-sm font-medium text-black mb-2">Evidence Frames (Sent to Telegram):</h4>
                         <div className="flex gap-2">
                           {log.frames && log.frames.length > 0 ? (
-                            log.frames.slice(0, 4).map((frame, index) => (
+                            log.frames.map((frame, index) => (
                               <div key={index} className="relative">
                                 <img
-                                  src={
-                                    backendConnected && frame.startsWith("http")
-                                      ? frame
-                                      : `/placeholder.svg?height=80&width=120&query=security camera frame ${index + 1}`
-                                  }
+                                  src={frame || "/placeholder.svg"}
                                   alt={`Frame ${index + 1}`}
                                   className="w-20 h-16 object-cover rounded border border-gray-300"
-                                  onLoad={() => {
-                                    console.log(`[v0] Successfully loaded frame: ${frame}`)
-                                  }}
                                   onError={(e) => {
-                                    console.log(`[v0] Failed to load frame: ${frame}`)
-                                    console.log(`[v0] Backend connected: ${backendConnected}`)
-                                    e.currentTarget.src = `/placeholder.svg?height=80&width=120&query=security camera frame ${index + 1}`
+                                    e.currentTarget.src = "/crime-detection-frame.jpg"
                                   }}
                                 />
-                                <div className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
+                                <div className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center font-bold">
                                   {index + 1}
                                 </div>
-                                {!backendConnected && (
-                                  <div className="absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center rounded">
-                                    <span className="text-white text-xs">Demo</span>
-                                  </div>
-                                )}
                               </div>
                             ))
                           ) : (
-                            <div className="text-sm text-gray-500 flex items-center gap-2">
-                              <AlertTriangle className="h-4 w-4" />
-                              {backendConnected
-                                ? "No frames captured for this incident"
-                                : "Backend required to view frames"}
-                            </div>
+                            <div className="text-sm text-gray-500">No frames available</div>
                           )}
                         </div>
-                      </div>
-
-                      <div className="flex gap-2 pt-2 border-t border-gray-100">
-                        <Button size="sm" variant="outline" className="border-gray-300 text-black bg-transparent">
-                          <Eye className="h-3 w-3 mr-1" />
-                          View Details
-                        </Button>
-                        {log.frames && log.frames.length > 0 && (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="border-gray-300 text-black bg-transparent"
-                            onClick={() => {
-                              if (backendConnected && log.frames[0]) {
-                                console.log(`[v0] Attempting to download frame: ${log.frames[0]}`)
-                                window.open(log.frames[0], "_blank")
-                              } else {
-                                console.log(`[v0] Download blocked - Backend connected: ${backendConnected}`)
-                                setCurrentAlert(
-                                  "Backend required for frame download. Start the Python Flask backend on localhost:5000.",
-                                )
-                                setTimeout(() => setCurrentAlert(null), 4000)
-                              }
-                            }}
-                          >
-                            <Download className="h-3 w-3 mr-1" />
-                            Download Frames
-                          </Button>
-                        )}
-                        {log.videoPath && (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="border-gray-300 text-black bg-transparent"
-                            onClick={() => {
-                              if (backendConnected) {
-                                window.open(`http://localhost:5000/api/download_video/${log.id}`, "_blank")
-                              } else {
-                                setCurrentAlert("Backend required for video download. Currently in demo mode.")
-                                setTimeout(() => setCurrentAlert(null), 3000)
-                              }
-                            }}
-                          >
-                            <FileVideo className="h-3 w-3 mr-1" />
-                            View Video
-                          </Button>
-                        )}
                       </div>
                     </div>
                   ))

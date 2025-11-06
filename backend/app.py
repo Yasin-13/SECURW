@@ -16,7 +16,7 @@ app = Flask(__name__)
 CORS(app)  # Enable CORS for React frontend
 
 # Initialize the Telegram bot with your bot's API token
-bot = telepot.Bot('6679358098:AAFmpDc7o4MwqDywDahyAK0Qq89IVZqNr04')  # Replace with your actual token
+bot = telepot.Bot('7992159975:AAE1j1SEyGVTqclby0cwLpqvnVwNVUi1GB4')  # Replace with your actual token
 
 # Global variables for detection state
 detection_active = False
@@ -50,9 +50,10 @@ class ViolenceDetector:
         self.prediction_queue = deque(maxlen=128)
         self.violence_threshold = 0.6
         self.total_incidents = 0
-        self.max_frames_per_incident = 4
+        self.max_frames_per_incident = 3  # Limit to 3 frames per incident
         self.current_incident_start = None
         self.current_incident_frames = []
+        self.last_incident_time = None
         
     def load_model(self):
         print("[INFO] Loading violence detection model...")
@@ -61,31 +62,27 @@ class ViolenceDetector:
             print("[INFO] Model loaded successfully")
         except Exception as e:
             print(f"[ERROR] Failed to load model: {e}")
-            # Create a dummy model for testing
             self.model = "dummy"
         
     def detect_violence_in_frame(self, frame):
-        """Detect violence in a single frame and return prediction"""
+        """Detect violence in a single frame with fast processing"""
         if self.model is None:
             self.load_model()
             
         try:
             if self.model == "dummy":
-                # For testing without actual model
                 prediction = np.random.random()
                 violence_detected = prediction > self.violence_threshold
                 return violence_detected, prediction
                 
-            # Preprocess frame
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_resized = cv2.resize(frame_rgb, (128, 128)).astype("float32")
-            frame_normalized = frame_resized.reshape(128, 128, 3) / 255
+            frame_normalized = frame_resized / 255.0
             
             # Get prediction
-            prediction = self.model.predict(np.expand_dims(frame_normalized, axis=0))[0][0]
+            prediction = self.model.predict(np.expand_dims(frame_normalized, axis=0), verbose=0)[0][0]
             self.prediction_queue.append(prediction)
             
-            # Simple threshold check - no smoothing needed for immediate logging
             violence_detected = prediction > self.violence_threshold
             
             return violence_detected, prediction
@@ -93,223 +90,186 @@ class ViolenceDetector:
             print(f"[ERROR] Detection failed: {e}")
             return False, 0.0
         
-    def _send_telegram_alert(self, timestamp, confidence, frame_path):
-        """Send Telegram alert with violence detection details and image"""
+    def _send_batched_telegram_alert(self, incident_frames):
+        """Send Telegram alert with ALL violence frames from incident"""
+        if not incident_frames:
+            return
+            
         try:
-            chat_id = '-949413618'  # Your Telegram group chat ID
+            chat_id = '-5096667007'
             
-            # Create alert message
-            severity = 'CRITICAL' if confidence >= 0.8 else 'MEDIUM' if confidence >= 0.6 else 'LOW'
+            # Calculate stats from all frames
+            avg_confidence = np.mean([conf for _, conf in incident_frames])
+            max_confidence = max([conf for _, conf in incident_frames])
             
-            message = f"""🚨 VIOLENCE DETECTED 🚨
+            severity = 'CRITICAL' if max_confidence >= 0.8 else 'MEDIUM' if max_confidence >= 0.6 else 'LOW'
             
-📅 Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}
-🎯 Confidence: {confidence:.1%}
+            message = f"""🚨 VIOLENCE INCIDENT DETECTED 🚨
+
+📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+📊 Frames Detected: {len(incident_frames)}
+🎯 Max Confidence: {max_confidence:.1%}
+📈 Avg Confidence: {avg_confidence:.1%}
 ⚠️ Severity: {severity}
 📍 Location: Security Camera Feed
+
+SecureWatch AI detected violence. Review {len(incident_frames)} critical frames."""
             
-SecureWatch AI has detected potential violence. Please review immediately."""
-            
-            # Send text message first
             bot.sendMessage(chat_id, message)
-            print(f"[INFO] Telegram alert sent successfully")
+            print(f"[INFO] Telegram alert sent - {len(incident_frames)} frames")
             
-            # Send image if frame exists
-            if frame_path and os.path.exists(frame_path):
-                try:
-                    with open(frame_path, 'rb') as photo:
-                        bot.sendPhoto(chat_id, photo, caption=f"Violence detected at {confidence:.1%} confidence")
-                    print(f"[INFO] Telegram photo sent successfully")
-                except Exception as photo_error:
-                    print(f"[ERROR] Failed to send photo: {photo_error}")
+            # Send all frames with individual scores
+            for idx, (frame_path, confidence) in enumerate(incident_frames, 1):
+                if frame_path and os.path.exists(frame_path):
+                    try:
+                        with open(frame_path, 'rb') as photo:
+                            frame_severity = 'CRITICAL' if confidence >= 0.8 else 'MEDIUM' if confidence >= 0.6 else 'LOW'
+                            caption = f"Frame {idx}/{len(incident_frames)} - Confidence: {confidence:.1%}"
+                            bot.sendPhoto(chat_id, photo, caption=caption)
+                        print(f"[INFO] Telegram photo {idx}/{len(incident_frames)} sent")
+                        time.sleep(0.3)
+                    except Exception as photo_error:
+                        print(f"[ERROR] Failed to send photo {idx}: {photo_error}")
             
-            # Update database to mark telegram as sent
             try:
                 conn = sqlite3.connect('crime_detections.db')
                 cursor = conn.cursor()
-                cursor.execute('''
-                    UPDATE incidents 
-                    SET telegram_sent = TRUE 
-                    WHERE frame_path = ? AND timestamp = ?
-                ''', (os.path.basename(frame_path), timestamp.strftime('%Y-%m-%d %H:%M:%S')))
+                for frame_path, _ in incident_frames:
+                    cursor.execute('UPDATE incidents SET telegram_sent = TRUE WHERE frame_path = ?', 
+                                 (os.path.basename(frame_path),))
                 conn.commit()
                 conn.close()
             except Exception as db_error:
-                print(f"[ERROR] Failed to update telegram_sent status: {db_error}")
+                print(f"[ERROR] Failed to update telegram_sent: {db_error}")
                 
         except telepot.exception.TelegramError as e:
             print(f"[ERROR] Telegram API error: {e}")
-            print("[TROUBLESHOOTING] Check:")
-            print("1. Bot token is correct")
-            print("2. Bot is added to the group")
-            print("3. Chat ID is correct")
-            print("4. Bot has permission to send messages")
         except Exception as e:
-            print(f"[ERROR] Telegram alert failed: {e}")
+            print(f"[ERROR] Batched telegram alert failed: {e}")
         
-    def log_violence_incident(self, frame, confidence, frame_number, video_path=None):
-        """Log violence detection with proper frame management - ONLY for violence=True frames"""
-        if confidence <= self.violence_threshold:
-            print(f"[WARNING] log_violence_incident called with low confidence {confidence:.3f} - skipping")
-            return
-            
+    def log_violence_incident(self, frame, confidence, frame_number):
+        """Log violence frames - collect max 3 frames per incident"""
         timestamp = datetime.now()
         
         if (self.current_incident_start is None or 
             (timestamp - self.current_incident_start).total_seconds() > 30):
+            # Send previous incident batch if it has frames
+            if self.current_incident_frames:
+                print(f"[INFO] Incident ended. Sending {len(self.current_incident_frames)} frames")
+                self._send_batched_telegram_alert(self.current_incident_frames)
+            
             self.current_incident_start = timestamp
             self.current_incident_frames = []
-            print(f"[DEBUG] Starting new incident period at {timestamp}")
+            self.total_incidents += 1
+            print(f"[DEBUG] New incident #{self.total_incidents}")
         
-        frame_filename = ""
+        if len(self.current_incident_frames) >= self.max_frames_per_incident:
+            print(f"[INFO] Reached 3-frame limit for this incident")
+            return
         
-        if len(self.current_incident_frames) < self.max_frames_per_incident:
-            try:
-                # Ensure directory exists with absolute path
-                evidence_dir = os.path.abspath('evidence_frames')
-                os.makedirs(evidence_dir, exist_ok=True)
-                print(f"[DEBUG] Evidence directory: {evidence_dir}")
-                
-                # Create filename with absolute path
-                frame_filename = os.path.join(evidence_dir, f'violence_{timestamp.strftime("%Y%m%d_%H%M%S")}_{frame_number}.jpg')
-                print(f"[DEBUG] Attempting to save VIOLENCE frame to: {frame_filename}")
-                
-                # Validate frame data
-                if frame is None or frame.size == 0:
-                    print(f"[ERROR] Invalid frame data - frame is None or empty")
-                    frame_filename = ""
-                else:
-                    # Save the frame with high quality
-                    success = cv2.imwrite(frame_filename, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        try:
+            evidence_dir = os.path.abspath('evidence_frames')
+            os.makedirs(evidence_dir, exist_ok=True)
+            
+            frame_filename = os.path.join(evidence_dir, f'violence_{timestamp.strftime("%Y%m%d_%H%M%S%f")}_{frame_number}.jpg')
+            
+            if frame is None or frame.size == 0:
+                print(f"[ERROR] Invalid frame data")
+                return
+            
+            success = cv2.imwrite(frame_filename, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            
+            if success and os.path.exists(frame_filename):
+                file_size = os.path.getsize(frame_filename)
+                if file_size > 0:
+                    self.current_incident_frames.append((frame_filename, confidence))
+                    print(f"[INFO] VIOLENCE FRAME {len(self.current_incident_frames)}/3 - Confidence: {confidence:.1%}")
                     
-                    if success and os.path.exists(frame_filename):
-                        # Verify file was actually created and has content
-                        file_size = os.path.getsize(frame_filename)
-                        if file_size > 0:
-                            self.current_incident_frames.append(frame_filename)
-                            print(f"[INFO] VIOLENCE FRAME SAVED - Confidence: {confidence:.3f}, File: {frame_filename} ({file_size} bytes)")
-                            print(f"[DEBUG] Violence frames in current incident: {len(self.current_incident_frames)}")
-                        else:
-                            print(f"[ERROR] Frame file created but empty: {frame_filename}")
-                            os.remove(frame_filename)  # Remove empty file
-                            frame_filename = ""
-                    else:
-                        print(f"[ERROR] cv2.imwrite failed or file not created: {frame_filename}")
-                        frame_filename = ""
+                    # Log to database
+                    try:
+                        conn = sqlite3.connect('crime_detections.db')
+                        cursor = conn.cursor()
                         
-            except Exception as e:
-                print(f"[ERROR] Frame saving exception: {e}")
-                frame_filename = ""
-        else:
-            print(f"[INFO] VIOLENCE DETECTED - Frame limit reached for current incident ({self.max_frames_per_incident})")
-        
-        if frame_filename:  # Only log incidents that have actual frames saved
-            try:
-                conn = sqlite3.connect('crime_detections.db')
-                cursor = conn.cursor()
-                
-                # Determine severity based on confidence
-                if confidence >= 0.8:
-                    severity = 'CRITICAL'
-                elif confidence >= 0.6:
-                    severity = 'MEDIUM'
+                        severity = 'CRITICAL' if confidence >= 0.8 else 'MEDIUM' if confidence >= 0.6 else 'LOW'
+                        db_frame_path = os.path.basename(frame_filename)
+                        
+                        cursor.execute('''
+                            INSERT INTO incidents (timestamp, confidence, frame_path, source, type, severity, status, telegram_sent)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+                            float(confidence),
+                            db_frame_path,
+                            'Upload',
+                            'Violence',
+                            severity,
+                            'Active',
+                            False
+                        ))
+                        conn.commit()
+                        conn.close()
+                        
+                    except Exception as e:
+                        print(f"[ERROR] Database logging failed: {e}")
                 else:
-                    severity = 'LOW'
-                
-                # Store relative path for database
-                db_frame_path = os.path.basename(frame_filename)
-                
-                cursor.execute('''
-                    INSERT INTO incidents (timestamp, confidence, frame_path, source, type, severity, status, telegram_sent)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    timestamp.strftime('%Y-%m-%d %H:%M:%S'),
-                    float(confidence),
-                    db_frame_path,  # Store just filename, not full path
-                    'Upload',
-                    'Violence',
-                    severity,
-                    'Active',
-                    False
-                ))
-                conn.commit()
-                conn.close()
-                
-                self.total_incidents += 1
-                print(f"[INFO] VIOLENCE INCIDENT LOGGED - Total incidents: {self.total_incidents}, Frame: {db_frame_path}")
-                
-                self._send_telegram_alert(timestamp, confidence, frame_filename)
-                
-            except Exception as e:
-                print(f"[ERROR] Database logging failed: {e}")
-        else:
-            print(f"[INFO] VIOLENCE DETECTED but no frame saved - not logging to database")
+                    os.remove(frame_filename)
+        except Exception as e:
+            print(f"[ERROR] Frame saving failed: {e}")
 
 def process_video_with_detection(input_video, output_video_path):
-    """Process video with immediate violence detection and logging"""
+    """Process video with frame-by-frame real-time violence detection"""
     detector = ViolenceDetector()
     
-    # Open video
     if isinstance(input_video, int):
         cap = cv2.VideoCapture(input_video)
-        is_webcam = True
     else:
         cap = cv2.VideoCapture(input_video)
-        is_webcam = False
         
     if not cap.isOpened():
         print(f"[ERROR] Could not open video: {input_video}")
         return 0
         
-    # Get video properties
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    # Setup video writer
     os.makedirs('processed_videos', exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
     
     frame_number = 0
+    skip_frames = 2  # Process every 3rd frame for faster processing
     
     print(f"[INFO] Starting video processing - FPS: {fps}, Size: {width}x{height}")
-    print(f"[INFO] VIOLENCE-ONLY MODE: Only frames with violence=True will be saved and logged")
     
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("[DEBUG] End of video reached")
+            # Send final batch
+            if detector.current_incident_frames:
+                print(f"[INFO] Video ended. Sending final {len(detector.current_incident_frames)} frames")
+                detector._send_batched_telegram_alert(detector.current_incident_frames)
             break
             
-        # Process frame for violence detection
-        violence_detected, confidence = detector.detect_violence_in_frame(frame)
+        if frame_number % (skip_frames + 1) == 0:
+            violence_detected, confidence = detector.detect_violence_in_frame(frame)
+            
+            if violence_detected and confidence > detector.violence_threshold:
+                detector.log_violence_incident(frame, confidence, frame_number)
         
-        if violence_detected and confidence > detector.violence_threshold:
-            print(f"[DEBUG] VIOLENCE CONFIRMED at frame {frame_number} with confidence {confidence:.3f}")
-            detector.log_violence_incident(frame, confidence, frame_number, output_video_path)
-        elif violence_detected:
-            print(f"[DEBUG] Violence detected but confidence too low: {confidence:.3f} (threshold: {detector.violence_threshold})")
-        
-        # Add overlay text
-        status_text = f"SecureWatch AI | Violence: {violence_detected} | Confidence: {confidence:.2f}"
-        color = (0, 0, 255) if violence_detected else (0, 255, 0)
-        cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        
-        # Write frame to output video
+        status_text = f"SecureWatch AI | Processing..."
+        cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         out.write(frame)
         
         frame_number += 1
         
-        # Show progress every 100 frames
-        if frame_number % 100 == 0:
-            print(f"[DEBUG] Processed {frame_number} frames, Violence incidents logged: {detector.total_incidents}")
+        if frame_number % 150 == 0:
+            print(f"[DEBUG] Processed {frame_number} frames, Incidents: {detector.total_incidents}")
     
-    # Cleanup
     cap.release()
     out.release()
     
-    print(f"[INFO] Video processing complete - Violence incidents detected and logged: {detector.total_incidents}")
+    print(f"[INFO] Processing complete - Total incidents: {detector.total_incidents}")
     return detector.total_incidents
 
 @app.route('/api/process_video', methods=['POST'])
@@ -321,18 +281,15 @@ def process_video():
     if video_file.filename == '':
         return jsonify({'error': 'No video file selected'}), 400
     
-    # Save uploaded video
     temp_video_path = f'temp_videos/uploaded_{int(time.time())}_{video_file.filename}'
     os.makedirs('temp_videos', exist_ok=True)
     video_file.save(temp_video_path)
     
-    # Process video
     output_video_path = f'processed_videos/processed_{int(time.time())}.mp4'
     
     print(f"[INFO] Processing uploaded video: {video_file.filename}")
     incidents_detected = process_video_with_detection(temp_video_path, output_video_path)
     
-    # Cleanup temp file
     try:
         os.remove(temp_video_path)
     except:
@@ -346,7 +303,7 @@ def process_video():
 
 @app.route('/api/detections', methods=['GET'])
 def get_detections():
-    """Get all incidents from database formatted for frontend - ONLY violence incidents with frames"""
+    """Get all violence incidents from database"""
     try:
         conn = sqlite3.connect('crime_detections.db')
         cursor = conn.cursor()
@@ -357,7 +314,6 @@ def get_detections():
         incident_groups = {}
         for row in rows:
             timestamp_obj = datetime.strptime(row[1], '%Y-%m-%d %H:%M:%S')
-            # Round to nearest 30 seconds for grouping
             seconds = timestamp_obj.second
             rounded_seconds = (seconds // 30) * 30
             timestamp_key = timestamp_obj.replace(second=rounded_seconds, microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
@@ -372,10 +328,9 @@ def get_detections():
                     'type': row[5],
                     'severity': row[6],
                     'status': row[7],
-                    'videoPath': None
                 }
             
-            if row[3] and row[3].strip() and len(incident_groups[timestamp_key]['frames']) < 4:
+            if row[3] and row[3].strip() and len(incident_groups[timestamp_key]['frames']) < 3:
                 evidence_dir = os.path.abspath('evidence_frames')
                 full_frame_path = os.path.join(evidence_dir, row[3])
                 
@@ -383,15 +338,10 @@ def get_detections():
                     frame_filename = os.path.basename(row[3])
                     frame_url = f"http://localhost:5000/api/frame/{frame_filename}"
                     incident_groups[timestamp_key]['frames'].append(frame_url)
-                    print(f"[DEBUG] Added VIOLENCE frame to incident: {frame_filename}")
-                else:
-                    print(f"[WARNING] Violence frame file not found: {full_frame_path}")
         
         detections = list(incident_groups.values())
         
-        print(f"[DEBUG] Returning {len(detections)} violence-only detections to frontend")
-        for detection in detections:
-            print(f"[DEBUG] Violence Detection {detection['id']}: {len(detection['frames'])} frames, Confidence: {detection['confidence']:.3f}")
+        print(f"[DEBUG] Returning {len(detections)} incidents to frontend")
         
         return jsonify(detections)
         
@@ -401,14 +351,13 @@ def get_detections():
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Health check endpoint for frontend"""
+    """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
         'message': 'SecureWatch AI Backend is running',
         'timestamp': datetime.now().isoformat()
     })
 
-# API Routes for React frontend
 @app.route('/api/start_detection', methods=['POST'])
 def start_detection():
     global detection_active, detection_thread
@@ -444,74 +393,26 @@ def detection_status():
         'detections': []
     })
 
-@app.route('/api/download_video/<video_id>', methods=['GET'])
-def download_video(video_id):
-    try:
-        conn = sqlite3.connect('crime_detections.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT frame_path FROM incidents WHERE id = ?', (video_id,))
-        row = cursor.fetchone()
-        conn.close()
-        
-        if row and row[0] and os.path.exists(row[0]):
-            return send_file(row[0], as_attachment=True)
-        else:
-            return jsonify({'error': 'File not found'}), 404
-    except Exception as e:
-        print(f"[ERROR] Download failed: {e}")
-        return jsonify({'error': 'Download failed'}), 500
-
 @app.route('/api/frame/<path:filename>')
 def serve_frame(filename):
     """Serve frame images for frontend display"""
     try:
         evidence_dir = os.path.abspath('evidence_frames')
         frame_path = os.path.join(evidence_dir, filename)
-        print(f"[DEBUG] Serving frame request: {filename}")
-        print(f"[DEBUG] Full frame path: {frame_path}")
         
         if os.path.exists(frame_path):
-            file_size = os.path.getsize(frame_path)
-            print(f"[DEBUG] Frame found and served: {filename} ({file_size} bytes)")
             return send_file(frame_path)
         else:
-            print(f"[ERROR] Frame not found: {frame_path}")
-            # List available files for debugging
-            if os.path.exists(evidence_dir):
-                available_files = os.listdir(evidence_dir)
-                print(f"[DEBUG] Available files in evidence_frames: {available_files[:10]}")  # Show first 10
             return jsonify({'error': 'Frame not found'}), 404
     except Exception as e:
         print(f"[ERROR] Frame serving failed: {e}")
         return jsonify({'error': 'Frame serving failed'}), 500
 
-# Original Flask routes for backward compatibility
 @app.route('/')
 def index():
     return render_template('index.html')
 
-@app.route('/detect_crime', methods=['POST'])
-def detect_crime():
-    global detection_active, detection_thread
-    
-    if 'source' in request.form:
-        source = request.form['source']
-        input_video = 0 if source == 'webcam' else 'your_video.mp4'
-        output_video_file = 'annotated_video.avi'
-        telegram_group_id = '-949413618'
-        
-        if not detection_active:
-            detection_active = True
-            detection_thread = threading.Thread(
-                target=process_video_with_detection,
-                args=(input_video, output_video_file)
-            )
-            detection_thread.start()
-
-    return redirect(url_for('index'))
-
 if __name__ == '__main__':
     print("[INFO] Starting SecureWatch AI Backend...")
     print("[INFO] Backend will be available at http://localhost:5000")
-    print("[INFO] Make sure to update Telegram bot token and group ID")
     app.run(debug=True, host='0.0.0.0', port=5000)
