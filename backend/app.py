@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, jsonify, send_file
+from flask import Flask, render_template, request, redirect, url_for, jsonify, send_file, Response
 from flask_cors import CORS
 import cv2
 import time
@@ -11,6 +11,8 @@ import os
 import threading
 import base64
 import sqlite3
+import subprocess
+import signal
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React frontend
@@ -21,6 +23,10 @@ bot = telepot.Bot('7992159975:AAE1j1SEyGVTqclby0cwLpqvnVwNVUi1GB4')  # Replace w
 # Global variables for detection state
 detection_active = False
 detection_thread = None
+opencv_process = None
+webcam_detector = None
+webcam_cap = None
+stream_active = False
 
 def init_database(): 
     conn = sqlite3.connect('crime_detections.db')
@@ -47,13 +53,18 @@ init_database()
 class ViolenceDetector:
     def __init__(self):
         self.model = None
-        self.prediction_queue = deque(maxlen=128)
-        self.violence_threshold = 0.6
+        self.prediction_queue = deque(maxlen=45)
+        self.confidence_queue = deque(maxlen=45)
+        self.violence_threshold = 0.50  # Lower threshold for video detection
+        self.high_confidence_threshold = 0.75
         self.total_incidents = 0
-        self.max_frames_per_incident = 3  # Limit to 3 frames per incident
+        self.max_frames_per_incident = 3
         self.current_incident_start = None
         self.current_incident_frames = []
         self.last_incident_time = None
+        self.consecutive_violence_frames = 0
+        self.min_consecutive_frames = 5  # Reduced for video detection
+        self.bot = telepot.Bot('7992159975:AAE1j1SEyGVTqclby0cwLpqvnVwNVUi1GB4')
         
     def load_model(self):
         print("[INFO] Loading violence detection model...")
@@ -62,101 +73,155 @@ class ViolenceDetector:
             print("[INFO] Model loaded successfully")
         except Exception as e:
             print(f"[ERROR] Failed to load model: {e}")
-            self.model = "dummy"
+            raise Exception("Model loading failed. Ensure 'modelnew.h5' exists.")
         
     def detect_violence_in_frame(self, frame):
-        """Detect violence in a single frame with fast processing"""
+        """Enhanced violence detection with improved preprocessing and temporal analysis"""
         if self.model is None:
             self.load_model()
             
         try:
-            if self.model == "dummy":
-                prediction = np.random.random()
-                violence_detected = prediction > self.violence_threshold
-                return violence_detected, prediction
-                
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_resized = cv2.resize(frame_rgb, (128, 128)).astype("float32")
             frame_normalized = frame_resized / 255.0
             
-            # Get prediction
-            prediction = self.model.predict(np.expand_dims(frame_normalized, axis=0), verbose=0)[0][0]
-            self.prediction_queue.append(prediction)
+            preds = self.model.predict(np.expand_dims(frame_normalized, axis=0), verbose=0)[0]
             
-            violence_detected = prediction > self.violence_threshold
+            if len(preds) == 1:
+                confidence = float(preds[0])
+            else:
+                confidence = float(preds[1]) if len(preds) > 1 else float(preds[0])
             
-            return violence_detected, prediction
+            violence_prediction = 1 if confidence > self.violence_threshold else 0
+            
+            if violence_prediction == 1:
+                self.consecutive_violence_frames += 1
+            else:
+                self.consecutive_violence_frames = 0
+            
+            self.prediction_queue.append(violence_prediction)
+            self.confidence_queue.append(confidence)
+            
+            violence_detected = self._strict_temporal_analysis()
+            
+            return violence_detected, confidence
         except Exception as e:
             print(f"[ERROR] Detection failed: {e}")
             return False, 0.0
+    
+
+    
+    def _strict_temporal_analysis(self):
+        """Lenient temporal analysis for video detection"""
+        if len(self.prediction_queue) < self.min_consecutive_frames:
+            return False
         
-    def _send_batched_telegram_alert(self, incident_frames):
-        """Send Telegram alert with ALL violence frames from incident"""
-        if not incident_frames:
+        # Check for sustained violence detection
+        recent_predictions = list(self.prediction_queue)[-self.min_consecutive_frames:]
+        recent_confidences = list(self.confidence_queue)[-self.min_consecutive_frames:]
+        
+        # More lenient criteria for video detection
+        violence_ratio = sum(recent_predictions) / len(recent_predictions)
+        avg_confidence = np.mean([conf for conf in recent_confidences if conf > self.violence_threshold]) if any(conf > self.violence_threshold for conf in recent_confidences) else 0
+        
+        # Lenient criteria for video processing
+        violence_detected = (
+            violence_ratio >= 0.6 or  # 60% of frames must be violence OR
+            (avg_confidence >= 0.65 and self.consecutive_violence_frames >= 3) or  # Good confidence with 3 consecutive frames OR
+            any(conf > 0.8 for conf in recent_confidences[-3:])  # Any high confidence in last 3 frames
+        )
+        
+        return violence_detected
+        
+    def send_telegram_alert(self):
+        """Send Telegram alert with violence frames"""
+        if not self.current_incident_frames:
             return
-            
+        
         try:
             chat_id = '-5096667007'
+            avg_confidence = np.mean([conf for _, conf in self.current_incident_frames])
+            max_confidence = max([conf for _, conf in self.current_incident_frames])
             
-            # Calculate stats from all frames
-            avg_confidence = np.mean([conf for _, conf in incident_frames])
-            max_confidence = max([conf for _, conf in incident_frames])
-            
-            severity = 'CRITICAL' if max_confidence >= 0.8 else 'MEDIUM' if max_confidence >= 0.6 else 'LOW'
-            
-            message = f"""🚨 VIOLENCE INCIDENT DETECTED 🚨
+            message = f"""🚨 VIOLENCE DETECTED 🚨
 
 📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-📊 Frames Detected: {len(incident_frames)}
+📊 Frames: {len(self.current_incident_frames)}
 🎯 Max Confidence: {max_confidence:.1%}
 📈 Avg Confidence: {avg_confidence:.1%}
-⚠️ Severity: {severity}
-📍 Location: Security Camera Feed
+📍 Real-time Camera Feed
 
-SecureWatch AI detected violence. Review {len(incident_frames)} critical frames."""
+Violence detected by AI system."""
             
-            bot.sendMessage(chat_id, message)
-            print(f"[INFO] Telegram alert sent - {len(incident_frames)} frames")
+            self.bot.sendMessage(chat_id, message)
             
-            # Send all frames with individual scores
-            for idx, (frame_path, confidence) in enumerate(incident_frames, 1):
-                if frame_path and os.path.exists(frame_path):
-                    try:
-                        with open(frame_path, 'rb') as photo:
-                            frame_severity = 'CRITICAL' if confidence >= 0.8 else 'MEDIUM' if confidence >= 0.6 else 'LOW'
-                            caption = f"Frame {idx}/{len(incident_frames)} - Confidence: {confidence:.1%}"
-                            bot.sendPhoto(chat_id, photo, caption=caption)
-                        print(f"[INFO] Telegram photo {idx}/{len(incident_frames)} sent")
-                        time.sleep(0.3)
-                    except Exception as photo_error:
-                        print(f"[ERROR] Failed to send photo {idx}: {photo_error}")
+            for idx, (frame_path, confidence) in enumerate(self.current_incident_frames, 1):
+                if os.path.exists(frame_path):
+                    with open(frame_path, 'rb') as photo:
+                        caption = f"Frame {idx}/{len(self.current_incident_frames)} - {confidence:.1%}"
+                        self.bot.sendPhoto(chat_id, photo, caption=caption)
+                    time.sleep(0.3)
             
-            try:
-                conn = sqlite3.connect('crime_detections.db')
-                cursor = conn.cursor()
-                for frame_path, _ in incident_frames:
-                    cursor.execute('UPDATE incidents SET telegram_sent = TRUE WHERE frame_path = ?', 
-                                 (os.path.basename(frame_path),))
-                conn.commit()
-                conn.close()
-            except Exception as db_error:
-                print(f"[ERROR] Failed to update telegram_sent: {db_error}")
-                
-        except telepot.exception.TelegramError as e:
-            print(f"[ERROR] Telegram API error: {e}")
+            print(f"[ALERT] Telegram alert sent - {len(self.current_incident_frames)} frames")
         except Exception as e:
-            print(f"[ERROR] Batched telegram alert failed: {e}")
+            print(f"[ERROR] Telegram alert failed: {e}")
         
+    def annotate_frame(self, frame, violence_detected, confidence):
+        """Add comprehensive violence indicators to frame"""
+        try:
+            annotated_frame = frame.copy()
+            height, width = annotated_frame.shape[:2]
+            
+            # Status text and color
+            status_text = "VIOLENCE DETECTED" if violence_detected else "NO VIOLENCE"
+            status_color = (0, 0, 255) if violence_detected else (0, 255, 0)
+            
+            # Background rectangle
+            cv2.rectangle(annotated_frame, (10, 10), (500, 120), (0, 0, 0), -1)
+            cv2.rectangle(annotated_frame, (10, 10), (500, 120), status_color, 3)
+            
+            # Status text
+            cv2.putText(annotated_frame, status_text, (20, 45), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, status_color, 3)
+            
+            # Confidence
+            conf_text = f"Confidence: {confidence:.1%}"
+            cv2.putText(annotated_frame, conf_text, (20, 75), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            
+            # Consecutive frames
+            consec_text = f"Consecutive: {self.consecutive_violence_frames}"
+            cv2.putText(annotated_frame, consec_text, (20, 100), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            
+            # Timestamp
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            cv2.putText(annotated_frame, timestamp, (width-150, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            
+            # Violence border and flashing effect
+            if violence_detected:
+                cv2.rectangle(annotated_frame, (0, 0), (width-1, height-1), (0, 0, 255), 8)
+                # Flashing effect
+                if int(time.time() * 2) % 2:
+                    overlay = annotated_frame.copy()
+                    cv2.rectangle(overlay, (0, 0), (width, height), (0, 0, 255), -1)
+                    annotated_frame = cv2.addWeighted(annotated_frame, 0.9, overlay, 0.1, 0)
+            
+            return annotated_frame
+        except Exception as e:
+            print(f"[ERROR] Failed to annotate frame: {e}")
+            return frame
+    
     def log_violence_incident(self, frame, confidence, frame_number):
-        """Log violence frames - collect max 3 frames per incident"""
+        """Log violence frames with visual indicators"""
         timestamp = datetime.now()
         
         if (self.current_incident_start is None or 
-            (timestamp - self.current_incident_start).total_seconds() > 30):
-            # Send previous incident batch if it has frames
+            (timestamp - self.current_incident_start).total_seconds() > 60):
             if self.current_incident_frames:
                 print(f"[INFO] Incident ended. Sending {len(self.current_incident_frames)} frames")
-                self._send_batched_telegram_alert(self.current_incident_frames)
+                self.send_telegram_alert()
             
             self.current_incident_start = timestamp
             self.current_incident_frames = []
@@ -164,66 +229,169 @@ SecureWatch AI detected violence. Review {len(incident_frames)} critical frames.
             print(f"[DEBUG] New incident #{self.total_incidents}")
         
         if len(self.current_incident_frames) >= self.max_frames_per_incident:
-            print(f"[INFO] Reached 3-frame limit for this incident")
             return
         
         try:
-            evidence_dir = os.path.abspath('evidence_frames')
-            os.makedirs(evidence_dir, exist_ok=True)
+            os.makedirs('evidence_frames', exist_ok=True)
+            frame_filename = f'evidence_frames/violence_{timestamp.strftime("%Y%m%d_%H%M%S%f")}_{frame_number}.jpg'
             
-            frame_filename = os.path.join(evidence_dir, f'violence_{timestamp.strftime("%Y%m%d_%H%M%S%f")}_{frame_number}.jpg')
+            annotated_frame = self.annotate_frame(frame, True, confidence)
+            success = cv2.imwrite(frame_filename, annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
             
-            if frame is None or frame.size == 0:
-                print(f"[ERROR] Invalid frame data")
-                return
-            
-            success = cv2.imwrite(frame_filename, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            
-            if success and os.path.exists(frame_filename):
-                file_size = os.path.getsize(frame_filename)
-                if file_size > 0:
-                    self.current_incident_frames.append((frame_filename, confidence))
-                    print(f"[INFO] VIOLENCE FRAME {len(self.current_incident_frames)}/3 - Confidence: {confidence:.1%}")
+            if success:
+                self.current_incident_frames.append((frame_filename, confidence))
+                print(f"[SAVED] Violence frame {len(self.current_incident_frames)}/3 - Confidence: {confidence:.1%}")
+                
+                # Log to database
+                try:
+                    conn = sqlite3.connect('crime_detections.db')
+                    cursor = conn.cursor()
                     
-                    # Log to database
-                    try:
-                        conn = sqlite3.connect('crime_detections.db')
-                        cursor = conn.cursor()
-                        
-                        severity = 'CRITICAL' if confidence >= 0.8 else 'MEDIUM' if confidence >= 0.6 else 'LOW'
-                        db_frame_path = os.path.basename(frame_filename)
-                        
-                        cursor.execute('''
-                            INSERT INTO incidents (timestamp, confidence, frame_path, source, type, severity, status, telegram_sent)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            timestamp.strftime('%Y-%m-%d %H:%M:%S'),
-                            float(confidence),
-                            db_frame_path,
-                            'Upload',
-                            'Violence',
-                            severity,
-                            'Active',
-                            False
-                        ))
-                        conn.commit()
-                        conn.close()
-                        
-                    except Exception as e:
-                        print(f"[ERROR] Database logging failed: {e}")
-                else:
-                    os.remove(frame_filename)
+                    severity = 'CRITICAL' if confidence >= 0.8 else 'MEDIUM' if confidence >= 0.6 else 'LOW'
+                    db_frame_path = os.path.basename(frame_filename)
+                    
+                    cursor.execute('''
+                        INSERT INTO incidents (timestamp, confidence, frame_path, source, type, severity, status, telegram_sent)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+                        float(confidence),
+                        db_frame_path,
+                        'Webcam',
+                        'Violence',
+                        severity,
+                        'Active',
+                        False
+                    ))
+                    conn.commit()
+                    conn.close()
+                    
+                except Exception as e:
+                    print(f"[ERROR] Database logging failed: {e}")
         except Exception as e:
             print(f"[ERROR] Frame saving failed: {e}")
 
-def process_video_with_detection(input_video, output_video_path):
-    """Process video with frame-by-frame real-time violence detection"""
+def process_webcam_detection():
+    """Enhanced real-time webcam detection with improved sensitivity"""
+    global detection_active
     detector = ViolenceDetector()
     
-    if isinstance(input_video, int):
-        cap = cv2.VideoCapture(input_video)
-    else:
-        cap = cv2.VideoCapture(input_video)
+    # Try multiple camera backends and indices
+    cap = None
+    backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    
+    for backend in backends:
+        for camera_index in [0, 1, 2]:
+            try:
+                cap = cv2.VideoCapture(camera_index, backend)
+                if cap.isOpened():
+                    # Test if we can actually read a frame
+                    ret, test_frame = cap.read()
+                    if ret and test_frame is not None:
+                        print(f"[INFO] Camera found at index {camera_index} with backend {backend}")
+                        break
+                    else:
+                        cap.release()
+                        cap = None
+                else:
+                    cap.release()
+                    cap = None
+            except Exception as e:
+                print(f"[DEBUG] Failed camera {camera_index} with backend {backend}: {e}")
+                if cap:
+                    cap.release()
+                cap = None
+        
+        if cap and cap.isOpened():
+            break
+    
+    if cap is None or not cap.isOpened():
+        print("[ERROR] Could not open any webcam with any backend")
+        detection_active = False
+        return 0
+    
+    # Set camera properties for better performance
+    try:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to avoid lag
+        
+        # Verify settings
+        actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"[INFO] Camera settings - Width: {actual_width}, Height: {actual_height}, FPS: {actual_fps}")
+    except Exception as e:
+        print(f"[WARN] Could not set camera properties: {e}")
+    
+    print("[INFO] Starting enhanced real-time webcam detection")
+    print(f"[INFO] Violence threshold: {detector.violence_threshold:.1%}")
+    print(f"[INFO] High confidence threshold: {detector.high_confidence_threshold:.1%}")
+    print(f"[INFO] Minimum consecutive frames required: {detector.min_consecutive_frames}")
+    
+    frame_number = 0
+    violence_detections = 0
+    last_detection_time = time.time()
+    
+    consecutive_failures = 0
+    max_failures = 10
+    
+    try:
+        while detection_active:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    print(f"[ERROR] Too many consecutive failures ({consecutive_failures}), stopping detection")
+                    break
+                print(f"[ERROR] Failed to read from webcam (attempt {consecutive_failures}/{max_failures})")
+                time.sleep(0.2)
+                continue
+            
+            consecutive_failures = 0  # Reset on successful read
+                
+            violence_detected, confidence = detector.detect_violence_in_frame(frame)
+            
+            # Annotate frame for display
+            annotated_frame = detector.annotate_frame(frame, violence_detected, confidence)
+            
+            if violence_detected:
+                violence_detections += 1
+                print(f"[DETECTION] Frame {frame_number} - Confidence: {confidence:.1%} - Consecutive: {detector.consecutive_violence_frames} - Total: {violence_detections}")
+                detector.log_violence_incident(frame, confidence, frame_number)
+                last_detection_time = time.time()
+            
+            frame_number += 1
+            
+            # Enhanced debug output
+            if frame_number % 150 == 0:
+                recent_confidences = list(detector.confidence_queue)[-10:] if detector.confidence_queue else [0]
+                avg_confidence = np.mean(recent_confidences)
+                print(f"[DEBUG] Frame {frame_number} - Consecutive: {detector.consecutive_violence_frames} - Avg confidence: {avg_confidence:.1%} - Detections: {violence_detections}")
+            
+            time.sleep(0.05)  # ~20 FPS to reduce load
+    
+    except Exception as e:
+        print(f"[ERROR] Detection loop error: {e}")
+    finally:
+        # Send final batch when stopping
+        if detector.current_incident_frames:
+            print(f"[INFO] Detection stopped. Sending final {len(detector.current_incident_frames)} frames")
+            detector.send_telegram_alert()
+        
+        cap.release()
+        print(f"[INFO] Webcam detection stopped:")
+        print(f"[INFO] - Total frames processed: {frame_number}")
+        print(f"[INFO] - Violence detections: {violence_detections}")
+        print(f"[INFO] - Incidents logged: {detector.total_incidents}")
+    
+    return detector.total_incidents
+
+def process_video_with_detection(input_video, output_video_path):
+    """Enhanced video processing with better frame sampling and detection"""
+    detector = ViolenceDetector()
+    cap = cv2.VideoCapture(input_video)
         
     if not cap.isOpened():
         print(f"[ERROR] Could not open video: {input_video}")
@@ -232,44 +400,59 @@ def process_video_with_detection(input_video, output_video_path):
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     os.makedirs('processed_videos', exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
     
     frame_number = 0
-    skip_frames = 2  # Process every 3rd frame for faster processing
+    processed_frames = 0
+    violence_frames = 0
     
-    print(f"[INFO] Starting video processing - FPS: {fps}, Size: {width}x{height}")
+    # Adaptive frame skipping based on FPS
+    skip_frames = max(1, fps // 15)  # Process ~15 frames per second
+    
+    print(f"[INFO] Processing video - FPS: {fps}, Size: {width}x{height}, Total frames: {total_frames}")
+    print(f"[INFO] Processing every {skip_frames + 1} frames for efficiency")
     
     while True:
         ret, frame = cap.read()
         if not ret:
-            # Send final batch
-            if detector.current_incident_frames:
-                print(f"[INFO] Video ended. Sending final {len(detector.current_incident_frames)} frames")
-                detector._send_batched_telegram_alert(detector.current_incident_frames)
             break
             
+        # Process every nth frame for detection
         if frame_number % (skip_frames + 1) == 0:
             violence_detected, confidence = detector.detect_violence_in_frame(frame)
+            processed_frames += 1
             
-            if violence_detected and confidence > detector.violence_threshold:
+            # Enhanced logging
+            if processed_frames % 50 == 0:
+                progress = (frame_number / total_frames) * 100 if total_frames > 0 else 0
+                print(f"[DEBUG] Progress: {progress:.1f}% - Frame {frame_number}/{total_frames} - Consecutive: {detector.consecutive_violence_frames} - Last confidence: {confidence:.1%}")
+            
+            if violence_detected:
+                violence_frames += 1
+                print(f"[DETECTION] Violence at frame {frame_number} - Confidence: {confidence:.1%} - Consecutive: {detector.consecutive_violence_frames} - Total: {violence_frames}")
                 detector.log_violence_incident(frame, confidence, frame_number)
         
-        status_text = f"SecureWatch AI | Processing..."
-        cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         out.write(frame)
-        
         frame_number += 1
-        
-        if frame_number % 150 == 0:
-            print(f"[DEBUG] Processed {frame_number} frames, Incidents: {detector.total_incidents}")
+    
+    # Send final batch
+    if detector.current_incident_frames:
+        print(f"[INFO] Video ended. Sending final {len(detector.current_incident_frames)} frames")
+        detector.send_telegram_alert()
     
     cap.release()
     out.release()
     
-    print(f"[INFO] Processing complete - Total incidents: {detector.total_incidents}")
+    print(f"[INFO] Video processing complete:")
+    print(f"[INFO] - Total frames: {frame_number}")
+    print(f"[INFO] - Processed frames: {processed_frames}")
+    print(f"[INFO] - Violence detections: {violence_frames}")
+    print(f"[INFO] - Incidents logged: {detector.total_incidents}")
+    
     return detector.total_incidents
 
 @app.route('/api/process_video', methods=['POST'])
@@ -358,39 +541,224 @@ def health_check():
         'timestamp': datetime.now().isoformat()
     })
 
+@app.route('/api/test_camera', methods=['GET'])
+def test_camera():
+    """Test camera availability and functionality"""
+    results = []
+    backends = [
+        (cv2.CAP_DSHOW, 'DirectShow'),
+        (cv2.CAP_MSMF, 'Media Foundation'),
+        (cv2.CAP_ANY, 'Any Available')
+    ]
+    
+    for backend_id, backend_name in backends:
+        for camera_index in [0, 1, 2]:
+            try:
+                cap = cv2.VideoCapture(camera_index, backend_id)
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                        height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                        fps = cap.get(cv2.CAP_PROP_FPS)
+                        results.append({
+                            'camera_index': camera_index,
+                            'backend': backend_name,
+                            'status': 'working',
+                            'width': int(width),
+                            'height': int(height),
+                            'fps': int(fps)
+                        })
+                    else:
+                        results.append({
+                            'camera_index': camera_index,
+                            'backend': backend_name,
+                            'status': 'opened_but_no_frame'
+                        })
+                    cap.release()
+                else:
+                    results.append({
+                        'camera_index': camera_index,
+                        'backend': backend_name,
+                        'status': 'failed_to_open'
+                    })
+            except Exception as e:
+                results.append({
+                    'camera_index': camera_index,
+                    'backend': backend_name,
+                    'status': 'error',
+                    'error': str(e)
+                })
+    
+    working_cameras = [r for r in results if r['status'] == 'working']
+    
+    return jsonify({
+        'working_cameras': len(working_cameras),
+        'total_tested': len(results),
+        'cameras': results,
+        'recommendation': 'Use DirectShow backend if available' if any(r['backend'] == 'DirectShow' and r['status'] == 'working' for r in results) else 'Try external USB camera if built-in camera fails'
+    })
+
+def generate_webcam_stream():
+    """Generate annotated webcam stream for frontend"""
+    global webcam_detector, webcam_cap, stream_active
+    
+    if not webcam_cap or not webcam_detector:
+        return
+    
+    frame_number = 0
+    
+    while stream_active:
+        try:
+            ret, frame = webcam_cap.read()
+            if not ret:
+                break
+            
+            # Detect violence and annotate frame
+            violence_detected, confidence = webcam_detector.detect_violence_in_frame(frame)
+            annotated_frame = webcam_detector.annotate_frame(frame, violence_detected, confidence)
+            
+            # Log violence if detected
+            if violence_detected:
+                webcam_detector.log_violence_incident(frame, confidence, frame_number)
+            
+            # Encode frame as JPEG
+            ret, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ret:
+                frame_bytes = buffer.tobytes()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            
+            frame_number += 1
+            time.sleep(0.033)  # ~30 FPS
+            
+        except Exception as e:
+            print(f"[ERROR] Stream generation error: {e}")
+            break
+
+@app.route('/api/video_stream')
+def video_stream():
+    """Video streaming route for frontend"""
+    return Response(generate_webcam_stream(),
+                   mimetype='multipart/x-mixed-replace; boundary=frame')
+
 @app.route('/api/start_detection', methods=['POST'])
 def start_detection():
-    global detection_active, detection_thread
+    global opencv_process
     
-    data = request.json or {}
-    source = data.get('source', 'webcam')
-    
-    if detection_active:
+    if opencv_process and opencv_process.poll() is None:
         return jsonify({'error': 'Detection already active'}), 400
     
-    detection_active = True
-    input_video = 0 if source == 'webcam' else data.get('video_path', 'your_video.mp4')
-    output_video_file = f'processed_videos/live_detection_{int(time.time())}.mp4'
+    # Quick camera test before starting
+    try:
+        test_cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if not test_cap.isOpened():
+            test_cap = cv2.VideoCapture(0, cv2.CAP_MSMF)
+        
+        if test_cap.isOpened():
+            ret, frame = test_cap.read()
+            test_cap.release()
+            if not ret or frame is None:
+                return jsonify({'error': 'Camera found but cannot read frames. Check camera permissions.'}), 400
+        else:
+            return jsonify({'error': 'No camera detected. Please check camera connection and permissions.'}), 400
+    except Exception as e:
+        return jsonify({'error': f'Camera test failed: {str(e)}'}), 400
     
-    detection_thread = threading.Thread(
-        target=process_video_with_detection,
-        args=(input_video, output_video_file)
-    )
-    detection_thread.start()
+    try:
+        # Start the OpenCV detection window
+        opencv_process = subprocess.Popen(
+            ['python', 'realtime_detection.py'],
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        
+        print("[INFO] OpenCV real-time detection window started")
+        return jsonify({
+            'message': 'OpenCV detection window started - Check your screen for the detection window', 
+            'status': 'active',
+            'pid': opencv_process.pid
+        })
+    except Exception as e:
+        return jsonify({'error': f'Failed to start OpenCV detection: {str(e)}'}), 500
 
-    return jsonify({'message': 'Detection started', 'status': 'active'})
+@app.route('/api/start_opencv_detection', methods=['POST'])
+def start_opencv_detection():
+    global opencv_process
+    
+    if opencv_process and opencv_process.poll() is None:
+        return jsonify({'error': 'OpenCV detection already running'}), 400
+    
+    try:
+        # Start the standalone OpenCV detection script
+        opencv_process = subprocess.Popen(
+            ['python', 'realtime_detection.py'],
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        
+        print("[INFO] OpenCV real-time detection window started")
+        return jsonify({
+            'message': 'OpenCV detection window started', 
+            'status': 'active',
+            'pid': opencv_process.pid
+        })
+    except Exception as e:
+        return jsonify({'error': f'Failed to start OpenCV detection: {str(e)}'}), 500
 
 @app.route('/api/stop_detection', methods=['POST'])
 def stop_detection():
-    global detection_active
-    detection_active = False
-    return jsonify({'message': 'Detection stopped', 'status': 'inactive'})
+    global opencv_process
+    
+    if not opencv_process or opencv_process.poll() is not None:
+        return jsonify({'error': 'No detection active'}), 400
+    
+    try:
+        # Terminate the OpenCV process
+        opencv_process.terminate()
+        opencv_process.wait(timeout=5)
+        
+        print("[INFO] OpenCV detection window stopped")
+        return jsonify({'message': 'OpenCV detection window closed', 'status': 'inactive'})
+    except subprocess.TimeoutExpired:
+        # Force kill if it doesn't terminate gracefully
+        opencv_process.kill()
+        opencv_process.wait()
+        return jsonify({'message': 'OpenCV detection force stopped', 'status': 'inactive'})
+    except Exception as e:
+        return jsonify({'error': f'Failed to stop OpenCV detection: {str(e)}'}), 500
+
+@app.route('/api/stop_opencv_detection', methods=['POST'])
+def stop_opencv_detection():
+    global opencv_process
+    
+    if not opencv_process or opencv_process.poll() is not None:
+        return jsonify({'error': 'No OpenCV detection running'}), 400
+    
+    try:
+        # Terminate the OpenCV process
+        opencv_process.terminate()
+        opencv_process.wait(timeout=5)
+        
+        print("[INFO] OpenCV detection window stopped")
+        return jsonify({'message': 'OpenCV detection stopped', 'status': 'inactive'})
+    except subprocess.TimeoutExpired:
+        # Force kill if it doesn't terminate gracefully
+        opencv_process.kill()
+        opencv_process.wait()
+        return jsonify({'message': 'OpenCV detection force stopped', 'status': 'inactive'})
+    except Exception as e:
+        return jsonify({'error': f'Failed to stop OpenCV detection: {str(e)}'}), 500
 
 @app.route('/api/detection_status', methods=['GET'])
 def detection_status():
+    global opencv_process
+    
+    opencv_running = opencv_process and opencv_process.poll() is None
+    
     return jsonify({
-        'active': detection_active,
-        'detections': []
+        'active': opencv_running,
+        'opencv_active': opencv_running,
+        'opencv_status': 'running' if opencv_running else 'stopped',
+        'timestamp': datetime.now().isoformat()
     })
 
 @app.route('/api/frame/<path:filename>')
@@ -415,4 +783,6 @@ def index():
 if __name__ == '__main__':
     print("[INFO] Starting SecureWatch AI Backend...")
     print("[INFO] Backend will be available at http://localhost:5000")
+    print("[INFO] Test camera at: http://localhost:5000/api/test_camera")
+    print("[INFO] OpenCV detection: POST /api/start_opencv_detection")
     app.run(debug=True, host='0.0.0.0', port=5000)

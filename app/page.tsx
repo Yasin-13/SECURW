@@ -47,6 +47,27 @@ export default function CrimeDetectionSystem() {
     }
   }
 
+  const checkDetectionStatus = async () => {
+    if (backendConnected) {
+      try {
+        const response = await fetch("http://localhost:5000/api/detection_status")
+        if (response.ok) {
+          const status = await response.json()
+          // Sync frontend state with backend
+          if (status.active !== isDetecting) {
+            setIsDetecting(status.active)
+            if (!status.active && isDetecting) {
+              setCurrentAlert("Detection window closed by backend")
+              setTimeout(() => setCurrentAlert(null), 2000)
+            }
+          }
+        }
+      } catch (error) {
+        console.log("[v0] Failed to check detection status")
+      }
+    }
+  }
+
   const fetchDetectionLogs = async () => {
     const isConnected = await checkBackendConnection()
 
@@ -69,54 +90,60 @@ export default function CrimeDetectionSystem() {
 
   useEffect(() => {
     fetchDetectionLogs()
-    const interval = setInterval(fetchDetectionLogs, 2000)
-    return () => clearInterval(interval)
-  }, [])
+    const logsInterval = setInterval(fetchDetectionLogs, 3000)
+    const statusInterval = setInterval(checkDetectionStatus, 1000)
+    
+    return () => {
+      clearInterval(logsInterval)
+      clearInterval(statusInterval)
+    }
+  }, [backendConnected, isDetecting])
 
   const startWebcamDetection = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true })
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream
-        videoRef.current.play()
-      }
-      setIsDetecting(true)
-
-      if (backendConnected) {
+    if (backendConnected) {
+      try {
         const response = await fetch("http://localhost:5000/api/start_detection", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ source: "webcam" }),
         })
         if (response.ok) {
-          setCurrentAlert("Live detection started - Monitoring for crime...")
+          const result = await response.json()
+          setIsDetecting(true)
+          
+          setCurrentAlert("🚨 DETECTION WINDOW OPENED - Check your screen for the OpenCV detection window with real-time annotations")
+          console.log("[v0] OpenCV detection window started successfully")
+        } else {
+          const errorData = await response.json()
+          setCurrentAlert(`Failed to start detection: ${errorData.error || 'Unknown error'}`)
         }
+      } catch (error) {
+        console.error("[v0] Detection start error:", error)
+        setCurrentAlert("Failed to start detection. Check backend connection.")
       }
-    } catch (error) {
-      setCurrentAlert("Camera access denied.")
+    } else {
+      setCurrentAlert("Backend not connected. Please start the Flask backend.")
     }
   }
 
   const stopDetection = async () => {
-    setIsDetecting(false)
-    if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream
-      stream.getTracks().forEach((track) => track.stop())
-      videoRef.current.srcObject = null
-    }
-
     if (backendConnected) {
       try {
-        await fetch("http://localhost:5000/api/stop_detection", {
+        const response = await fetch("http://localhost:5000/api/stop_detection", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
         })
-        setCurrentAlert("Detection stopped")
-        setTimeout(() => setCurrentAlert(null), 2000)
+        if (response.ok) {
+          setCurrentAlert("✅ Detection window closed - Final incident batch sent to Telegram")
+          console.log("[v0] Detection stopped successfully")
+        }
       } catch (error) {
         console.log("[v0] Failed to stop detection")
+        setCurrentAlert("Detection stopped (backend communication failed)")
       }
     }
+    
+    setIsDetecting(false)
+    setTimeout(() => setCurrentAlert(null), 3000)
   }
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -233,26 +260,28 @@ export default function CrimeDetectionSystem() {
                       </Badge>
                     </CardTitle>
                     <CardDescription className="text-gray-600">
-                      Real-time violence detection with instant Telegram alerts
+                      Opens OpenCV window with real-time violence detection and live annotations
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
                     <div className="relative bg-black rounded-lg overflow-hidden aspect-video">
-                      <video ref={videoRef} className="w-full h-full object-cover" muted />
-                      {!isDetecting && (
-                        <div className="absolute inset-0 flex items-center justify-center">
-                          <div className="text-center text-gray-400">
-                            <Camera className="h-16 w-16 mx-auto mb-4 opacity-50" />
-                            <p>Click "Start Detection" to begin monitoring</p>
-                          </div>
+                      <div className="w-full h-full flex items-center justify-center bg-gray-900 rounded">
+                        <div className="text-center text-gray-400">
+                          <Camera className="h-16 w-16 mx-auto mb-4 opacity-50" />
+                          <p className="text-sm">Detection runs in separate OpenCV window</p>
+                          <p className="text-xs mt-2">Click Start Detection to open annotated camera feed</p>
                         </div>
-                      )}
+                      </div>
                       {isDetecting && (
-                        <div className="absolute top-4 left-4">
-                          <Badge variant="destructive" className="animate-pulse">
-                            <div className="w-2 h-2 bg-red-500 rounded-full mr-2 animate-ping" />
-                            LIVE MONITORING
-                          </Badge>
+                        <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-75">
+                          <div className="text-center text-white">
+                            <Badge variant="destructive" className="animate-pulse mb-4">
+                              <div className="w-2 h-2 bg-red-500 rounded-full mr-2 animate-ping" />
+                              DETECTION ACTIVE
+                            </Badge>
+                            <p className="text-sm">OpenCV window is running</p>
+                            <p className="text-xs mt-2">Check your screen for the detection window</p>
+                          </div>
                         </div>
                       )}
                     </div>
