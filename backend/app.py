@@ -13,6 +13,7 @@ import base64
 import sqlite3
 import subprocess
 import signal
+import sys
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React frontend
@@ -55,15 +56,15 @@ class ViolenceDetector:
         self.model = None
         self.prediction_queue = deque(maxlen=45)
         self.confidence_queue = deque(maxlen=45)
-        self.violence_threshold = 0.50  # Lower threshold for video detection
-        self.high_confidence_threshold = 0.75
+        self.violence_threshold = 0.70  # 50% threshold for realtime detection
+        self.high_confidence_threshold = 0.85
         self.total_incidents = 0
         self.max_frames_per_incident = 3
         self.current_incident_start = None
         self.current_incident_frames = []
         self.last_incident_time = None
         self.consecutive_violence_frames = 0
-        self.min_consecutive_frames = 5  # Reduced for video detection
+        self.min_consecutive_frames = 3  # Reduced for faster response
         self.bot = telepot.Bot('7992159975:AAE1j1SEyGVTqclby0cwLpqvnVwNVUi1GB4')
         
     def load_model(self):
@@ -112,23 +113,18 @@ class ViolenceDetector:
 
     
     def _strict_temporal_analysis(self):
-        """Lenient temporal analysis for video detection"""
+        """Simple temporal analysis for realtime detection"""
         if len(self.prediction_queue) < self.min_consecutive_frames:
             return False
         
-        # Check for sustained violence detection
+        # Check recent frames for violence
         recent_predictions = list(self.prediction_queue)[-self.min_consecutive_frames:]
         recent_confidences = list(self.confidence_queue)[-self.min_consecutive_frames:]
         
-        # More lenient criteria for video detection
-        violence_ratio = sum(recent_predictions) / len(recent_predictions)
-        avg_confidence = np.mean([conf for conf in recent_confidences if conf > self.violence_threshold]) if any(conf > self.violence_threshold for conf in recent_confidences) else 0
-        
-        # Lenient criteria for video processing
+        # Simple criteria for realtime detection
         violence_detected = (
-            violence_ratio >= 0.6 or  # 60% of frames must be violence OR
-            (avg_confidence >= 0.65 and self.consecutive_violence_frames >= 3) or  # Good confidence with 3 consecutive frames OR
-            any(conf > 0.8 for conf in recent_confidences[-3:])  # Any high confidence in last 3 frames
+            any(conf > 0.50 for conf in recent_confidences) and  # Any frame > 50%
+            sum(recent_predictions) >= 2  # At least 2 of last 3 frames
         )
         
         return violence_detected
@@ -666,9 +662,9 @@ def start_detection():
         return jsonify({'error': f'Camera test failed: {str(e)}'}), 400
     
     try:
-        # Start the OpenCV detection window
+        # Start the OpenCV detection window using current Python interpreter
         opencv_process = subprocess.Popen(
-            ['python', 'realtime_detection.py'],
+            [sys.executable, 'realtime_detection.py'],
             cwd=os.path.dirname(os.path.abspath(__file__))
         )
         
@@ -689,9 +685,9 @@ def start_opencv_detection():
         return jsonify({'error': 'OpenCV detection already running'}), 400
     
     try:
-        # Start the standalone OpenCV detection script
+        # Start the standalone OpenCV detection script using current Python interpreter
         opencv_process = subprocess.Popen(
-            ['python', 'realtime_detection.py'],
+            [sys.executable, 'realtime_detection.py'],
             cwd=os.path.dirname(os.path.abspath(__file__))
         )
         

@@ -2,34 +2,21 @@ import cv2
 import numpy as np
 from datetime import datetime
 from collections import deque
+from keras.models import load_model
 import telepot
 import os
 import time
 import sqlite3
-
-# Try to import Keras with fallback
-try:
-    from keras.models import load_model
-    KERAS_AVAILABLE = True
-except ImportError:
-    try:
-        from tensorflow.keras.models import load_model
-        KERAS_AVAILABLE = True
-    except ImportError:
-        print("[WARNING] Neither Keras nor TensorFlow.Keras available. Running in demo mode.")
-        KERAS_AVAILABLE = False
-        def load_model(path):
-            return None
 
 class RealtimeViolenceDetector:
     def __init__(self):
         self.model = None
         self.prediction_queue = deque(maxlen=45)
         self.confidence_queue = deque(maxlen=45)
-        self.violence_threshold = 0.70
-        self.high_confidence_threshold = 0.85
+        self.violence_threshold = 0.70  # Same as video upload
+        self.high_confidence_threshold = 0.75
         self.consecutive_violence_frames = 0
-        self.min_consecutive_frames = 15
+        self.min_consecutive_frames = 5  # Same as video upload
         self.current_incident_frames = []
         self.current_incident_start = None
         self.total_incidents = 0
@@ -37,43 +24,30 @@ class RealtimeViolenceDetector:
         
     def load_model(self):
         print("[INFO] Loading violence detection model...")
-        if not KERAS_AVAILABLE:
-            print("[WARNING] Keras not available. Running in demo mode with random predictions.")
-            self.model = None
-            return
-        
         try:
             self.model = load_model('modelnew.h5')
             print("[INFO] Model loaded successfully")
         except Exception as e:
             print(f"[ERROR] Failed to load model: {e}")
-            print("[WARNING] Running in demo mode with random predictions.")
-            self.model = None
+            raise Exception("Model loading failed. Ensure 'modelnew.h5' exists.")
     
     def detect_violence_in_frame(self, frame):
-        if self.model is None and KERAS_AVAILABLE:
+        if self.model is None:
             self.load_model()
         
         try:
-            if self.model is None:
-                # Demo mode - generate random predictions for testing
-                import random
-                confidence = random.uniform(0.1, 0.9)
-                violence_prediction = 1 if confidence > self.violence_threshold else 0
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_resized = cv2.resize(frame_rgb, (128, 128)).astype("float32")
+            frame_normalized = frame_resized / 255.0
+            
+            preds = self.model.predict(np.expand_dims(frame_normalized, axis=0), verbose=0)[0]
+            
+            if len(preds) == 1:
+                confidence = float(preds[0])
             else:
-                # Real model prediction
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_resized = cv2.resize(frame_rgb, (128, 128)).astype("float32")
-                frame_normalized = frame_resized / 255.0
-                
-                preds = self.model.predict(np.expand_dims(frame_normalized, axis=0), verbose=0)[0]
-                
-                if len(preds) == 1:
-                    confidence = float(preds[0])
-                else:
-                    confidence = float(preds[1]) if len(preds) > 1 else float(preds[0])
-                
-                violence_prediction = 1 if confidence > self.violence_threshold else 0
+                confidence = float(preds[1]) if len(preds) > 1 else float(preds[0])
+            
+            violence_prediction = 1 if confidence > self.violence_threshold else 0
             
             if violence_prediction == 1:
                 self.consecutive_violence_frames += 1
@@ -97,13 +71,14 @@ class RealtimeViolenceDetector:
         recent_predictions = list(self.prediction_queue)[-self.min_consecutive_frames:]
         recent_confidences = list(self.confidence_queue)[-self.min_consecutive_frames:]
         
+        # Same lenient criteria as video upload
         violence_ratio = sum(recent_predictions) / len(recent_predictions)
-        avg_confidence = np.mean([conf for conf in recent_confidences if conf > self.violence_threshold])
+        avg_confidence = np.mean([conf for conf in recent_confidences if conf > self.violence_threshold]) if any(conf > self.violence_threshold for conf in recent_confidences) else 0
         
         violence_detected = (
-            violence_ratio >= 0.8 and
-            avg_confidence >= 0.75 and
-            self.consecutive_violence_frames >= 10
+            violence_ratio >= 0.6 or  # 60% of frames must be violence OR
+            (avg_confidence >= 0.65 and self.consecutive_violence_frames >= 3) or  # Good confidence with 3 consecutive frames OR
+            any(conf > 0.8 for conf in recent_confidences[-3:])  # Any high confidence in last 3 frames
         )
         
         return violence_detected
